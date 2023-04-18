@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use log::{debug, info};
+use regex::Regex;
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
@@ -43,6 +44,13 @@ pub enum PushProfileError {
     CopyExit(Option<i32>),
     #[error("The remote building option is not supported when using legacy nix")]
     RemoteBuildWithLegacyNix,
+
+    #[error("Failed to run 'nix --version' command: {0}")]
+    NixVersion(std::io::Error),
+    #[error("'nix --version' command output contained an invalid UTF-8 sequence: {0}")]
+    NixVersionUtf8(std::str::Utf8Error),
+    #[error("Failed to parse nix version")]
+    NixVersionParse,
 }
 
 pub struct PushProfileData<'a> {
@@ -215,6 +223,16 @@ pub async fn build_profile(data: PushProfileData<'_>) -> Result<(), PushProfileE
         &data.deploy_data.profile.profile_settings.path
     );
 
+    let nix_version_output = Command::new("nix").arg("--version")
+        .output()
+        .await.map_err(PushProfileError::NixVersion)?;
+
+    let version_regex = Regex::new(r"(\d+\.\d+\..+)").unwrap();
+    let nix_version = version_regex.
+        find(std::str::from_utf8(&nix_version_output.stdout).
+        map_err(PushProfileError::NixVersionUtf8)?).map(|v : regex::Match| -> &str { v.as_str() }).
+        ok_or(PushProfileError::NixVersionParse)?;
+
     // `nix-store --query --deriver` doesn't work on invalid paths, so we parse output of show-derivation :(
     let mut show_derivation_command = Command::new("nix");
 
@@ -238,19 +256,27 @@ pub async fn build_profile(data: PushProfileData<'_>) -> Result<(), PushProfileE
     )
     .map_err(PushProfileError::ShowDerivationParse)?;
 
-    let derivation_name = derivation_info
+    let &deriver = derivation_info
         .keys()
         .next()
         .ok_or(PushProfileError::ShowDerivationEmpty)?;
+
+    // Since nix 2.15.0 'nix build <path>.drv' will build only the .drv file itself, not the
+    // derivation outputs, '^out' is used to refer to outputs explicitly
+    let new_deriver = &(deriver.to_owned().to_string() + "^out");
+
+    // '<smth>.drv^' syntax is only available since nix 2.13, so we're avoiding adding '^out'
+    // in case available nix doesn't support this feature yet
+    let deriver = if nix_version > "2.13" { new_deriver } else { deriver };
 
     if data.deploy_data.merged_settings.remote_build.unwrap_or(false) {
         if !data.supports_flakes {
             return Err(PushProfileError::RemoteBuildWithLegacyNix)
         }
 
-        build_profile_remotely(&data, derivation_name).await?;
+        build_profile_remotely(&data, &deriver).await?;
     } else {
-        build_profile_locally(&data, derivation_name).await?;
+        build_profile_locally(&data, &deriver).await?;
     }
 
     Ok(())
